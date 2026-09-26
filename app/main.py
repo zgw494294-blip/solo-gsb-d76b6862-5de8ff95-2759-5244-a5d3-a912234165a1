@@ -12,6 +12,7 @@ from .capture_index import capture_index
 from .digest_audit import digest_audit
 from .extract import extract
 from .http_exchanges import http_exchanges
+from .member_pack import member_pack
 from .merge import merge
 from .navigate import navigate
 from .page_assets import page_assets
@@ -20,7 +21,7 @@ from .snapshot_diff import snapshot_diff
 
 app = FastAPI(
     title="WARC Replay API",
-    version="1.8.0",
+    version="1.9.0",
     description="接收 Base64 编码的自包含 WARC：/v1/replay 还原 response/revisit "
     "记录，/v1/extract 按记录 ID 导出子集（含引用链传递依赖），"
     "/v1/navigate 按时点离线还原页面（跟随重定向），"
@@ -32,7 +33,9 @@ app = FastAPI(
     "response/revisit 记录按左包、右包原序合并为一份可回放归档（跨包 ID "
     "冲突时为右包冲突记录生成确定性新 ID），/v1/http-exchanges 按双方任一"
     "侧的 WARC-Concurrent-To 显式关联重建 request 与 response/revisit 的 "
-    "HTTP 交换（允许前向引用，URL/时间相同不配对）。",
+    "HTTP 交换（允许前向引用，URL/时间相同不配对），/v1/member-pack 把 "
+    "response/revisit 记录按归档原序逐记录打成独立 gzip member，生成可按"
+    "记录定位的多 member gzip（固定 gzip 时间戳，输出确定）。",
 )
 
 
@@ -421,3 +424,42 @@ class HttpExchangesResponse(BaseModel):
           status_code=200)
 async def post_http_exchanges(payload: HttpExchangesRequest) -> dict[str, Any]:
     return http_exchanges(payload.warc)
+
+
+class MemberPackRequest(BaseModel):
+    warc: str = Field(
+        ...,
+        description="Base64 编码的 WARC 数据（可带空白/换行），解码后不超过 "
+        "2 MiB；空字符串表示空 WARC，返回空包与空 member 列表",
+    )
+
+
+class MemberPackMember(BaseModel):
+    record_id: str = Field(..., description="该 member 对应记录的 "
+                                            "WARC-Record-ID 原始值")
+    offset: int = Field(
+        ..., description="该记录 gzip member 在 gzip_warc 中的起始字节偏移"
+    )
+    length: int = Field(
+        ..., description="该记录 gzip member 的压缩字节长度；各 member 范围"
+        "连续且互不重叠，gzip_warc[offset:offset+length] 即该记录的独立 "
+        "gzip member，单独解压得到完整 WARC 记录及记录分隔符"
+    )
+
+
+class MemberPackResponse(BaseModel):
+    count: int = Field(..., description="收录的 response/revisit 记录数")
+    gzip_warc: str = Field(
+        ..., description="按归档原序逐记录生成的多 member gzip（每记录一个 "
+        "独立 gzip member，顺序拼接）的 Base64 编码；gzip 头时间戳固定，"
+        "同一输入产出逐字节相同的输出"
+    )
+    members: list[MemberPackMember] = Field(
+        ..., description="各记录 ID 对应的压缩 member 字节范围，按归档原序"
+    )
+
+
+@app.post("/v1/member-pack", response_model=MemberPackResponse,
+          status_code=200)
+async def post_member_pack(payload: MemberPackRequest) -> dict[str, Any]:
+    return member_pack(payload.warc)
