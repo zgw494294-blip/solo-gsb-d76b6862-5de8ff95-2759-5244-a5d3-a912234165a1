@@ -12,6 +12,7 @@ from .capture_index import capture_index
 from .digest_audit import digest_audit
 from .extract import extract
 from .http_exchanges import http_exchanges
+from .member_pack import member_pack
 from .merge import merge
 from .navigate import navigate
 from .page_assets import page_assets
@@ -20,7 +21,7 @@ from .snapshot_diff import snapshot_diff
 
 app = FastAPI(
     title="WARC Replay API",
-    version="1.8.0",
+    version="1.9.0",
     description="接收 Base64 编码的自包含 WARC：/v1/replay 还原 response/revisit "
     "记录，/v1/extract 按记录 ID 导出子集（含引用链传递依赖），"
     "/v1/navigate 按时点离线还原页面（跟随重定向），"
@@ -32,7 +33,8 @@ app = FastAPI(
     "response/revisit 记录按左包、右包原序合并为一份可回放归档（跨包 ID "
     "冲突时为右包冲突记录生成确定性新 ID），/v1/http-exchanges 按双方任一"
     "侧的 WARC-Concurrent-To 显式关联重建 request 与 response/revisit 的 "
-    "HTTP 交换（允许前向引用，URL/时间相同不配对）。",
+    "HTTP 交换（允许前向引用，URL/时间相同不配对），/v1/member-pack 把 "
+    "response/revisit 记录按归档原序打成可按记录定位的多 member gzip。",
 )
 
 
@@ -421,3 +423,40 @@ class HttpExchangesResponse(BaseModel):
           status_code=200)
 async def post_http_exchanges(payload: HttpExchangesRequest) -> dict[str, Any]:
     return http_exchanges(payload.warc)
+
+
+class MemberPackRequest(BaseModel):
+    warc: str = Field(
+        ...,
+        description="Base64 编码的 WARC 数据（可带空白/换行），解码后不超过 "
+        "2 MiB；空字符串表示空 WARC，返回空 gzip 与空成员列表",
+    )
+
+
+class GzipMember(BaseModel):
+    record_id: str = Field(..., description="该 gzip member 对应记录的 "
+                           "WARC-Record-ID 原始值")
+    offset: int = Field(
+        ..., description="该 member 在 gzip_warc 字节流中的起始偏移"
+    )
+    length: int = Field(
+        ..., description="该 member 的压缩字节长度；各 member 的 "
+        "[offset, offset+length) 范围连续且互不重叠"
+    )
+
+
+class MemberPackResponse(BaseModel):
+    count: int = Field(..., description="打包的 response/revisit 记录数")
+    gzip_warc: str = Field(
+        ..., description="多 member gzip（每记录一个独立 member）的 Base64 "
+        "编码；gzip 时间戳固定，同一输入产出相同字节"
+    )
+    members: list[GzipMember] = Field(
+        ..., description="各 gzip member 的压缩字节范围，按归档原序"
+    )
+
+
+@app.post("/v1/member-pack", response_model=MemberPackResponse,
+          status_code=200)
+async def post_member_pack(payload: MemberPackRequest) -> dict[str, Any]:
+    return member_pack(payload.warc)

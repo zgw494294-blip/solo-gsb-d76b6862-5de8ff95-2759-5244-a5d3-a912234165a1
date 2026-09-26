@@ -1,6 +1,6 @@
 # WARC Revisit Replay API
 
-基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供九个接口：
+基于 **Python + FastAPI + [warcio](https://github.com/webrecorder/warcio)** 的 WARC 离线还原服务，提供十个接口：
 
 - `POST /v1/replay`：接收 Base64 编码的自包含 WARC，按 `WARC-Record-ID` 建索引，
   将 `revisit` 记录沿 `WARC-Refers-To` 引用链还原到终点 `response` 的正文；
@@ -28,6 +28,10 @@
   HTTP 交换（允许前向引用；URL 或时间相同不构成配对），按请求归档序
   返回双方 ID、目标 URL、请求方法、请求目标与响应状态，未配对的两类
   记录分别按原序列出。
+- `POST /v1/member-pack`：接收 Base64 WARC，把 `response`/`revisit`
+  记录按归档原序每条打成一个**独立 gzip member**，组成可按记录随机定位
+  的多 member gzip；返回整包 Base64 与各记录的压缩 `offset`/`length`，
+  gzip 时间戳固定、同输入同字节。
 
 ## 一条命令启动（端口 8000）
 
@@ -922,6 +926,109 @@ curl -s http://localhost:8000/v1/http-exchanges \
 }
 ```
 
+### `POST /v1/member-pack`
+
+接收 Base64 WARC，把其中的 `response`/`revisit` 记录按**归档原序**每条
+打成一个**独立的 gzip member**，拼接为可按记录随机定位的多 member gzip。
+输入归档完整经过与 `/v1/replay` 相同的解码（2 MiB 上限、gzip）与结构/
+引用链校验——任何一处错误（包括不参与打包的 `warcinfo`/`request` 等
+记录）都使整个请求返回 422。
+
+请求体：
+
+| 字段   | 类型   | 说明 |
+|--------|--------|------|
+| `warc` | string | **Base64 编码**的 WARC；解码后 **≤ 2 MiB**，支持 gzip（单流或多 member）。空字符串表示空 WARC，返回空 gzip 与空成员列表。 |
+
+打包规则：
+
+- **只收录** `response`/`revisit`（`warcinfo`/`request` 等类型丢弃），
+  按归档原序排列；每个 gzip member 单独解压后是**一条完整 WARC 记录
+  及记录分隔符（`CRLF CRLF`）**，可独立解压、独立重新解析；
+- 记录以**原始字节**写出：WARC/HTTP 头与负载逐字节保留，
+  `Content-Length` 与记录块一致；
+- **末记录缺 `Content-Length`**（其记录块按规则延伸至 EOF）时，为它
+  注入**准确块长**，使 member 尾部新追加的 `CRLF CRLF` 是记录分隔符而
+  不会进入正文（HTTP 头与原负载字节不变）；
+- gzip 头时间戳（MTIME）**固定为 0**、压缩级别固定，因此同一输入永远
+  产出**完全相同的字节**；输入本身是否 gzip 不影响输出；
+- 响应中每个 member 的 `[offset, offset+length)` 是它在 `gzip_warc`
+  字节流中的压缩范围：自第一条起 `offset` 为 0，各范围**连续且互不
+  重叠**，末条范围结束处即整包结尾；对该范围切片即可单独解压出对应
+  记录，无需解压整包；
+- 整包**解压后**超过 **2 MiB** → **422** `payload_too_large`（注意
+  每个 member 都带 `CRLF CRLF` 尾部分隔符，解压后体积可能略大于输入）；
+- 交付前整包会再经一次完整的回放口径校验（结构、引用链），并比对
+  `/v1/replay` 的 HTTP 状态、正文与 `body_source_id` 与原归档完全一致；
+  打包结果一旦无法回放，返回 **422** `invalid_member_pack` 而不是
+  200 + 无法回放的 `gzip_warc`。
+
+响应（`200`）：
+
+| 字段                  | 含义 |
+|-----------------------|------|
+| `count`               | 打包的 response/revisit 记录数（即 gzip member 数） |
+| `gzip_warc`           | 多 member gzip 的 Base64 编码 |
+| `members`             | 各 member 的压缩字节范围，按归档原序 |
+| `members[].record_id` | 对应记录的 `WARC-Record-ID` 原始值 |
+| `members[].offset`    | member 在 `gzip_warc` 字节流中的起始偏移（首条为 0） |
+| `members[].length`    | member 的压缩字节长度 |
+
+把 `gzip_warc` 整体解码后直接交给 `/v1/replay`（接口支持多 member
+gzip），各记录的 HTTP 状态、正文与来源 ID 与原归档一致（记录因丢弃
+其余类型而重新连续编号，`order` 相应变化）。
+
+#### 示例
+
+归档含 response `<urn:uuid:aaaa>`（正文 `hello`）与引用它的 revisit
+`<urn:uuid:bbbb>`：
+
+```bash
+curl -s http://localhost:8000/v1/member-pack \
+  -H 'Content-Type: application/json' \
+  -d "{\"warc\":\"$(base64 -w0 sample.warc)\"}"
+```
+
+响应（两条记录各为一个 gzip member，范围 `[0,192)` 与 `[192,356)`
+连续且不重叠）：
+
+```json
+{
+  "count": 2,
+  "gzip_warc": "H4sIAAAAAAACA0VPywqDMBC8B/IP+QFNlJ7SBxQ9VFpokRSht6CLCpqEuEL7941F6TKHYXdnZ7Y6lxlP4oSSKrBIfRxI5mFy1kywNkuorW+iIpfsMHsj57lvpA51WhdyjUGVilREIglQQsgfXttZ7VvA6FkWknWITnIObz26AeLajpySzBoEg6u/dm7oa429NXxZ37NxajGMjv9km+IGpsUuuO8ooeSi1GN5J4QR7H5dWh0Mg13IF8cWaczrAAAAH4sIAAAAAAACA02NQQuCQBCF74L/Yf/AuLseOgwRhF6ETmII3TadVNBdWceof99SFr15h8cwb776WGZSJzqO6pCges6EwtN9WAbediU1zrdQ5Cj2q7e4rkOL16DDdpAbDqVUpRrUDpSulMK3L9+vxnfEcC4LFD3zjFLSw0zzSEnjJvnj3MgvULl/jgkKnMxZJstwIttxj0LF0WdeA14LwsAAAAA=",
+  "members": [
+    {"record_id": "<urn:uuid:aaaa>", "offset": 0, "length": 192},
+    {"record_id": "<urn:uuid:bbbb>", "offset": 192, "length": 164}
+  ]
+}
+```
+
+按 `offset`/`length` 切片即可**只解压并定位单条记录**，整包解压后
+再提交给 `/v1/replay` 则得到与原归档一致的回放结果：
+
+```bash
+python3 - <<'EOF'
+import base64, gzip, json, urllib.request
+
+# 假设 resp 为上面的响应
+resp = {"gzip_warc": "...", "members": [...]}
+packed = base64.b64decode(resp["gzip_warc"])
+
+# 1) 随机定位：只解压第 2 条 member（revisit）
+m = resp["members"][1]
+one = gzip.decompress(packed[m["offset"]:m["offset"] + m["length"]])
+assert one.startswith(b"WARC/") and one.endswith(b"\r\n\r\n")
+open("second-record.warc", "wb").write(one)
+
+# 2) 整包解压（多 member gzip 自动串联）交给 /v1/replay
+req = urllib.request.Request(
+    "http://localhost:8000/v1/replay",
+    data=json.dumps({"warc": resp["gzip_warc"]}).encode(),
+    headers={"Content-Type": "application/json"})
+print(json.load(urllib.request.urlopen(req))["count"], "条记录回放一致")
+EOF
+```
+
 ## 错误处理（HTTP 422 / 404）
 
 输入与结构错误统一返回 **422**；`/v1/navigate` 与 `/v1/page-assets` 在某一跳
@@ -936,8 +1043,9 @@ curl -s http://localhost:8000/v1/http-exchanges \
 }
 ```
 
-九个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
-先旧后新；`/v1/merge` 同样对左、右两包各自独立校验，先左后右）：
+十个接口共用的 WARC 错误（`/v1/snapshot-diff` 对两份归档各自独立校验，
+先旧后新；`/v1/merge` 同样对左、右两包各自独立校验，先左后右；
+`/v1/member-pack` 对输入整包完整校验，包括不参与打包的记录）：
 
 | `error`                        | 触发条件                                         | 附加字段 |
 |--------------------------------|--------------------------------------------------|----------|
@@ -1025,6 +1133,15 @@ HTTP 头与 revisit 引用链等共用错误同上表；`duplicate_record_id` �
 | 422  | `inconsistent_partners`        | 双方都有声明但指向不同伙伴（A 声明 B，B 声明的却不是 A） | `record_id`, `partner_id`, `partner_points_to` |
 | 422  | `multiple_partners`            | 同一记录涉及多个伙伴（自己声明与被他人声明合计超过一个） | `record_id`, `partners`（按伙伴记录归档序） |
 
+`/v1/member-pack` 额外的错误（解码、截断、缺/重复记录 ID、response HTTP
+头与 revisit 引用链等共用错误同上表；整包校验覆盖 `warcinfo`/`request`
+等不参与打包的记录）：
+
+| HTTP | `error`                 | 触发条件                                       | 附加字段 |
+|------|-------------------------|------------------------------------------------|----------|
+| 422  | `payload_too_large`     | 打包后（多 member gzip **解压后**）WARC 超过 2 MiB | `decoded_size`, `max_bytes` |
+| 422  | `invalid_member_pack`   | 打包结果交付前的回放口径校验未通过（结构/引用链错误，或回放的状态、正文、来源 ID 与原归档不一致）；此时不返回 `gzip_warc`，避免伪成功 | `cause`（底层错误码）及底层错误的附加字段 |
+
 ## 开发与测试
 
 ```bash
@@ -1047,6 +1164,7 @@ app/
   capture_index.py # /v1/capture-index：排序键分页、cursor 编解码与字节范围
   merge.py         # /v1/merge：双包原序合并、跨包冲突确定性改名与末记录补长
   http_exchanges.py# /v1/http-exchanges：WARC-Concurrent-To 显式配对与交换重建
+  member_pack.py   # /v1/member-pack：逐记录独立 gzip member 打包、固定时间戳与定位范围
 tests/
   test_replay.py
   test_extract.py
@@ -1057,6 +1175,7 @@ tests/
   test_capture_index.py
   test_merge.py
   test_http_exchanges.py
+  test_member_pack.py
 Dockerfile
 docker-compose.yml
 requirements.txt
